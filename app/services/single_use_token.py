@@ -53,6 +53,16 @@ class SingleUseTokenStore:
     def _redis_key(self, token: str) -> str:
         return f"{self._key_prefix}:{token}"
 
+    def key_for(self, token: str) -> str:
+        """Return the Redis key used for *token*.
+
+        Callers that share the store's namespace (e.g. the idempotency
+        middleware caching response bodies under the claimed key) must use
+        this instead of re-deriving the key, so the claim and the value live
+        under the same key.
+        """
+        return self._redis_key(token)
+
     def _circuit_open(self) -> bool:
         return time.monotonic() < self._disabled_until
 

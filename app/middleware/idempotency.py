@@ -24,11 +24,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
 from app.services.formatters import canonical_json
+from app.services.single_use_token import SingleUseTokenStore
 
 logger = logging.getLogger(__name__)
 
 # How long (seconds) to disable Redis after a failure (#314 circuit breaker)
 _CIRCUIT_OPEN_TTL = 30
+
+# Marker written by the claim step while a request is still in flight (see
+# SingleUseTokenStore.consume).  A cached response is always a JSON object,
+# so this short value can never be confused with one.
+_IN_FLIGHT_MARKER = "1"
 
 
 def _compute_fingerprint(method: str, path: str, body: bytes) -> str:
@@ -56,6 +62,11 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.redis = redis_client or Redis.from_url(settings.CELERY_BROKER_URL)
         self.ttl = settings.IDEMPOTENCY_KEY_TTL_HOURS * 3600
+        # Issue #267: the key is claimed atomically (SET NX EX) before the
+        # request is processed, so two concurrent requests with the same key
+        # cannot both run the side effects.  The claim shares the single-use
+        # token store used by the payment callback replay guard.
+        self.single_use = SingleUseTokenStore(key_prefix="idempotency", redis_client=self.redis)
         # Circuit-breaker state (#314): timestamp until which Redis is skipped
         self._disabled_until: float = 0.0
 
@@ -94,6 +105,16 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
             logger.warning("Idempotency middleware: Redis SETEX failed: %s", exc)
             self._trip_circuit()
 
+    def _redis_delete(self, key: str) -> None:
+        """Delete a key (used to release a claim on non-2xx responses)."""
+        if self._circuit_open():
+            return
+        try:
+            self.redis.delete(key)
+        except RedisError as exc:
+            logger.warning("Idempotency middleware: Redis DEL failed: %s", exc)
+            self._trip_circuit()
+
     # ------------------------------------------------------------------
     # Middleware dispatch
     # ------------------------------------------------------------------
@@ -109,13 +130,24 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
         body = await request.body()
         fingerprint = _compute_fingerprint(request.method, request.url.path, body)
 
-        # #313: scope the cache key to the authenticated user
+        # #313: scope the key to the authenticated user; the store adds the
+        # "idempotency:" namespace prefix.
         actor = _actor_key(request)
-        cache_key = f"idempotency:{actor}:{idempotency_key}"
+        token = f"{actor}:{idempotency_key}"
+        cache_key = self.single_use.key_for(token)
 
-        # Replay cached response if present
-        existing = self._redis_get(cache_key)
-        if existing is not None:
+        # Issue #267: atomically claim the key before processing.  A failed
+        # claim means the key was already used (cached response to replay) or
+        # is in flight on another worker (409 while the first request runs).
+        claimed = self.single_use.consume(token, self.ttl)
+        if not claimed:
+            existing = self._redis_get(cache_key)
+            if existing is None or existing == _IN_FLIGHT_MARKER.encode():
+                return Response(
+                    status_code=409,
+                    content=json.dumps({"detail": "Idempotency-Key already in use"}),
+                    media_type="application/json",
+                )
             cached = json.loads(existing)
             if cached["fingerprint"] != fingerprint:
                 return Response(
@@ -136,7 +168,8 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
             response_body += chunk
 
         # #312: only cache successful (2xx) responses; 5xx are never cached so
-        # the caller can safely retry with the same Idempotency-Key.
+        # the caller can safely retry with the same Idempotency-Key.  Non-2xx
+        # responses release the claim so a retry is not blocked.
         if 200 <= response.status_code < 300:
             cached_response = {
                 "fingerprint": fingerprint,
@@ -145,6 +178,8 @@ class IdempotencyMiddleware(BaseHTTPMiddleware):
                 "media_type": response.media_type or "application/json",
             }
             self._redis_setex(cache_key, self.ttl, json.dumps(cached_response))
+        else:
+            self._redis_delete(cache_key)
 
         return Response(
             status_code=response.status_code,
