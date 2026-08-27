@@ -15,6 +15,7 @@ from app.models.webhook import Webhook, WebhookDelivery, WebhookDeliveryStatus, 
 
 from app.services.audit_log import audit_log
 from app.services.formatters import canonical_json
+from app.services.secret_encryption import decrypt_secret, encrypt_secret
 from app.services.webhook_service import WEBHOOK_SCHEMA_VERSION
 from app.utils.network_validation import validate_webhook_url
 
@@ -237,7 +238,8 @@ def create_webhook(payload: WebhookCreate, current_user=Depends(require_admin), 
     webhook = Webhook(
         name=payload.name,
         url=url,
-        secret=payload.secret,
+        # #266: never store the raw signing secret; encrypt at rest.
+        secret=encrypt_secret(payload.secret) if payload.secret else None,
         events=canonical_json([e.value for e in payload.events]),
         max_retries=payload.max_retries,
         is_active=payload.is_active,
@@ -287,7 +289,8 @@ def update_webhook(
         webhook.url = url
         webhook.resolved_ips = canonical_json(resolved_ips)
     if payload.secret is not None:
-        webhook.secret = payload.secret
+        # #266: never store the raw signing secret; encrypt at rest.
+        webhook.secret = encrypt_secret(payload.secret)
     if payload.events is not None:
         webhook.events = canonical_json([e.value for e in payload.events])
     if payload.max_retries is not None:
@@ -388,12 +391,15 @@ def rotate_webhook_secret(webhook_id: UUID, current_user=Depends(require_admin),
     old_secret_version = webhook.secret_version
     old_rotation_time = webhook.last_secret_rotation_at
 
-    # Store old secret in previous_secrets with expiry
-    if webhook.secret:
+    # Store old secret in previous_secrets with expiry.  The stored value is
+    # encrypted at rest (#266), so hash the *decrypted* secret so the entry
+    # stays comparable to the actual signing key.
+    current_secret = decrypt_secret(webhook.secret) if webhook.secret else None
+    if current_secret:
         now = datetime.now(UTC)
         expires_at = now + timedelta(hours=settings.WEBHOOK_SECRET_GRACE_HOURS)
         previous_entry = {
-            "hashed_secret": hash_token(webhook.secret),
+            "hashed_secret": hash_token(current_secret),
             "created_at": now.isoformat(),
             "expires_at": expires_at.isoformat(),
         }
@@ -401,9 +407,9 @@ def rotate_webhook_secret(webhook_id: UUID, current_user=Depends(require_admin),
             webhook.previous_secrets = []
         webhook.previous_secrets.append(previous_entry)
 
-    # Generate new secret and update metadata
+    # Generate new secret and update metadata (encrypted at rest)
     new_secret = secrets.token_hex(32)
-    webhook.secret = new_secret
+    webhook.secret = encrypt_secret(new_secret)
     webhook.secret_version = old_secret_version + 1
     webhook.last_secret_rotation_at = datetime.now(UTC)
 

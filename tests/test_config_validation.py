@@ -1,6 +1,9 @@
 import unittest
 
-from app.core.config import Settings, validate_critical_settings, MIN_SECRET_KEY_LENGTH
+from app.core.config import Settings, validate_critical_settings
+
+# Valid Fernet key (32 url-safe base64 bytes) for WEBHOOK_SECRET_ENCRYPTION_KEY
+VALID_FERNET_KEY = "3Axxvzn-yND3zGIIHvm5ygVFcgarKcvyczwe8lga-7A="
 
 
 class ConfigValidationTests(unittest.TestCase):
@@ -21,6 +24,7 @@ class ConfigValidationTests(unittest.TestCase):
             "ENVIRONMENT": "local",
             "SECRET_KEY": "apexchainx-dev-secret",
             "PAYMENT_WEBHOOK_SECRET": "test-webhook-secret-1234",
+            "WEBHOOK_SECRET_ENCRYPTION_KEY": VALID_FERNET_KEY,
         }
         defaults.update(overrides)
         return Settings.model_construct(**defaults)
@@ -218,6 +222,47 @@ class ConfigValidationTests(unittest.TestCase):
     def test_webhook_secret_not_checked_in_local(self):
         validate_critical_settings(
             self.make_settings(ENVIRONMENT="local", PAYMENT_WEBHOOK_SECRET="")
+        )
+
+    # ------------------------------------------------------------------ #
+    # WEBHOOK_SECRET_ENCRYPTION_KEY validation (#266)                     #
+    # ------------------------------------------------------------------ #
+
+    def test_empty_webhook_secret_encryption_key_rejected_in_production(self):
+        with self.assertRaises(ValueError) as ctx:
+            validate_critical_settings(
+                self.make_settings(
+                    ENVIRONMENT="production",
+                    SECRET_KEY="a-very-long-secure-production-secret-key-1234567890",
+                    WEBHOOK_SECRET_ENCRYPTION_KEY="",
+                )
+            )
+
+        self.assertIn("WEBHOOK_SECRET_ENCRYPTION_KEY", str(ctx.exception))
+
+    def test_invalid_fernet_key_rejected_in_production(self):
+        with self.assertRaises(ValueError) as ctx:
+            validate_critical_settings(
+                self.make_settings(
+                    ENVIRONMENT="production",
+                    SECRET_KEY="a-very-long-secure-production-secret-key-1234567890",
+                    WEBHOOK_SECRET_ENCRYPTION_KEY="not-a-fernet-key",
+                )
+            )
+
+        self.assertIn("WEBHOOK_SECRET_ENCRYPTION_KEY", str(ctx.exception))
+
+    def test_valid_fernet_key_accepted_in_production(self):
+        validate_critical_settings(
+            self.make_settings(
+                ENVIRONMENT="production",
+                SECRET_KEY="a-very-long-secure-production-secret-key-1234567890",
+            )
+        )
+
+    def test_webhook_secret_encryption_key_not_required_in_local(self):
+        validate_critical_settings(
+            self.make_settings(ENVIRONMENT="local", WEBHOOK_SECRET_ENCRYPTION_KEY="")
         )
 
     # ------------------------------------------------------------------ #

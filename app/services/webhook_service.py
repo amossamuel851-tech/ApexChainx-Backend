@@ -17,6 +17,7 @@ from app.core.tracing import get_current_traceparent, traced
 from app.models.webhook import Webhook, WebhookDelivery, WebhookDeliveryStatus, WebhookEvent
 from app.services.formatters import canonical_json
 from app.services.metrics import increment_counter
+from app.services.secret_encryption import decrypt_secret
 from app.services.webhook_breaker import breaker
 from app.services.webhook_signing import (
     CURRENT_SIGNATURE_VERSION,
@@ -139,8 +140,11 @@ def _build_headers(
     if traceparent:
         headers["traceparent"] = traceparent
 
-    if webhook.secret:
-        sig_hex, _ = sign_payload(webhook.secret, payload, signature_version)
+    # The secret is encrypted at rest (#266); recover the plaintext only
+    # here, at signing time, so a database leak never exposes live keys.
+    secret = decrypt_secret(webhook.secret)
+    if secret:
+        sig_hex, _ = sign_payload(secret, payload, signature_version)
         headers["X-Webhook-Signature"] = f"sha256={sig_hex}"
         headers["X-Webhook-Signature-Version"] = str(signature_version)
     return headers
