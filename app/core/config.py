@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     # Webhook secret rotation grace period (#9)
     # Number of hours the previous secret remains valid after rotation.
     WEBHOOK_SECRET_GRACE_HOURS: int = 24
+    # Fernet key (32 url-safe base64 bytes) for encrypting webhook signing
+    # secrets at rest (#266).  Required in non-local environments so a
+    # database leak cannot expose live HMAC signing keys.
+    WEBHOOK_SECRET_ENCRYPTION_KEY: str = ""
 
     # OAuth configuration (#10)
     OAUTH_REDIRECT_URI_ALLOWLIST: list[str] = ["http://localhost:3000/oauth/callback"]
@@ -218,6 +222,20 @@ def validate_critical_settings(config: Settings) -> None:
             errors.append(
                 f"PAYMENT_WEBHOOK_SECRET must not be empty in ENVIRONMENT={config.ENVIRONMENT!r}."
             )
+
+        if not config.WEBHOOK_SECRET_ENCRYPTION_KEY:
+            errors.append(
+                f"WEBHOOK_SECRET_ENCRYPTION_KEY must not be empty in ENVIRONMENT={config.ENVIRONMENT!r}."
+            )
+        else:
+            from app.services.secret_encryption import is_valid_fernet_key
+
+            if not is_valid_fernet_key(config.WEBHOOK_SECRET_ENCRYPTION_KEY):
+                errors.append(
+                    "WEBHOOK_SECRET_ENCRYPTION_KEY must be a valid Fernet key "
+                    "(32 url-safe base64 bytes, e.g. from `python -c \"from cryptography.fernet import Fernet; "
+                    "print(Fernet.generate_key().decode())\"`)."
+                )
 
     try:
         delays = [int(d.strip()) for d in config.WEBHOOK_RETRY_BASE_DELAYS.split(",") if d.strip()]
