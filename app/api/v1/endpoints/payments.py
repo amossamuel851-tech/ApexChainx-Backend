@@ -2,7 +2,6 @@ import csv
 import hashlib
 import hmac
 import io
-import time
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
@@ -17,29 +16,17 @@ from app.db.session import get_db
 from app.models.payment import PaginatedPayments, PaymentTransaction, PaymentTransitionError
 from app.repositories.payment_repository import PaymentRepository
 from app.services.audit_log import audit_log
+from app.services.single_use_token import SingleUseTokenStore
 from app.utils.cursor import CursorPage, encode_cursor, decode_cursor
 
 router = APIRouter()
 
-_SEEN_NONCES: dict[str, float] = {}
 CALLBACK_NONCE_TTL_SECONDS = 300
 
-
-def _evict_stale_nonces() -> None:
-    """Remove nonces older than the replay window (called on each callback)."""
-    cutoff = time.monotonic() - CALLBACK_NONCE_TTL_SECONDS
-    stale = [k for k, ts in _SEEN_NONCES.items() if ts < cutoff]
-    for k in stale:
-        del _SEEN_NONCES[k]
-
-
-def _is_replay(nonce: str) -> bool:
-    """Return True if *nonce* has been seen within the replay window."""
-    _evict_stale_nonces()
-    if nonce in _SEEN_NONCES:
-        return True
-    _SEEN_NONCES[nonce] = time.monotonic()
-    return False
+# BE-028 replay protection: the nonce window must be shared across all app
+# workers, not just one process, so it lives in Redis (SET NX EX) with a
+# bounded in-process fallback for Redis outages (see single_use_token.py).
+nonce_store = SingleUseTokenStore(key_prefix="callback_nonce")
 
 
 # BE-027: Schemas for reconciliation history
@@ -440,13 +427,19 @@ def provider_callback(
     """
     Inbound callback from a payment provider to update payment status (BE-028).
 
-    Security model:
-    - HMAC-SHA256 signature (X-Webhook-Signature) verified when
-      PAYMENT_WEBHOOK_SECRET is configured.  The signed message includes the
-      nonce so replaying a captured request fails if the nonce changes.
-    - Replay protection: the nonce (from X-Callback-Nonce header or the
-      ``nonce`` body field) must be unique within a 5-minute window.
-      Duplicate nonces are rejected with 409 Conflict.
+    Security model (signature now required):
+    - HMAC-SHA256 signature (X-Webhook-Signature) is verified against
+      PAYMENT_WEBHOOK_SECRET, which must be configured in non-local
+      environments (enforced at startup by validate_critical_settings).
+      The signed message is ``<transaction_id>:<status>:<nonce>`` so
+      replaying a captured request fails if the nonce changes.
+    - A nonce is REQUIRED for every callback (X-Callback-Nonce header or
+      the ``nonce`` body field).  Callbacks without one are rejected with
+      400 and error code ``NONCE_REQUIRED``.
+    - Replay protection: the nonce must be unique within the
+      CALLBACK_NONCE_TTL_SECONDS window.  The window is enforced in Redis
+      (shared across all app workers); duplicate nonces are rejected with
+      409 Conflict.
     - Idempotency: a callback that moves a payment into its current status
       is silently accepted (returns 200 with the unchanged record).
     - Failures and suspicious events are written to the audit log so they
@@ -455,7 +448,18 @@ def provider_callback(
     # --- 1. Resolve nonce (header takes precedence over body field) ----------
     effective_nonce = x_callback_nonce or payload.nonce
 
-    # --- 2. Authenticate signature -------------------------------------------
+    # --- 2. Nonce is mandatory (replay protection requires it) ---------------
+    if not effective_nonce:
+        audit_log.log(
+            "callback_rejected_missing_nonce",
+            {"transaction_id": payload.transaction_id, "provider_ref": payload.provider_ref},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="NONCE_REQUIRED: callback nonce is required for replay protection",
+        )
+
+    # --- 3. Authenticate signature -------------------------------------------
     secret = settings.PAYMENT_WEBHOOK_SECRET
     if secret:
         if not x_webhook_signature:
@@ -478,20 +482,20 @@ def provider_callback(
             )
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-    if effective_nonce:
-        if _is_replay(effective_nonce):
-            audit_log.log(
-                "callback_rejected_replay",
-                {
-                    "transaction_id": payload.transaction_id,
-                    "nonce": effective_nonce,
-                    "provider_ref": payload.provider_ref,
-                },
-            )
-            raise HTTPException(
-                status_code=409,
-                detail="Duplicate callback nonce – possible replay attack",
-            )
+    # --- 4. Replay protection (shared across workers via Redis) --------------
+    if not nonce_store.consume(effective_nonce, CALLBACK_NONCE_TTL_SECONDS):
+        audit_log.log(
+            "callback_rejected_replay",
+            {
+                "transaction_id": payload.transaction_id,
+                "nonce": effective_nonce,
+                "provider_ref": payload.provider_ref,
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Duplicate callback nonce – possible replay attack",
+        )
 
     repo = PaymentRepository(db)
     existing = repo.get(payload.transaction_id)
