@@ -31,9 +31,13 @@ def _lock_id_from_key(key: str) -> int:
     """Convert a string key to a 64-bit integer for PostgreSQL advisory locks.
 
     Uses SHA-256 to generate a deterministic hash, then takes the first 8 bytes.
+    The value must fit in a signed bigint: pg_advisory_xact_lock /
+    pg_try_advisory_xact_lock accept bigint (signed 64-bit), and passing an
+    unsigned value that exceeds 2**63 - 1 fails with
+    "function pg_advisory_xact_lock(numeric) does not exist".
     """
     hash_bytes = hashlib.sha256(key.encode("utf-8")).digest()
-    return int.from_bytes(hash_bytes[:8], byteorder="big", signed=False)
+    return int.from_bytes(hash_bytes[:8], byteorder="big", signed=True)
 
 
 @contextmanager

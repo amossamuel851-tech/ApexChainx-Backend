@@ -18,7 +18,12 @@ from app.services.formatters import canonical_json
 from app.services.webhook_service import WEBHOOK_SCHEMA_VERSION
 from app.utils.network_validation import validate_webhook_url
 
-router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
+# Router-level auth (issue #265): every webhook route — including the
+# delivery inspection/retry/replay/dead-letter sub-resources — requires an
+# admin session.  Previously the sub-resources only depended on the DB
+# session, so delivery internals were readable and retry/replay could be
+# triggered anonymously.
+router = APIRouter(prefix="/webhooks", tags=["Webhooks"], dependencies=[Depends(require_admin)])
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +226,7 @@ def _serialize_delivery(delivery: WebhookDelivery) -> WebhookDeliveryResponse:
         error_message=delivery.error_message,
         delivered_at=delivery.delivered_at.isoformat() if delivery.delivered_at else None,
         dead_lettered_at=delivery.dead_lettered_at.isoformat() if delivery.dead_lettered_at else None,
+        signature_version=delivery.signature_version,
         created_at=delivery.created_at.isoformat(),
     )
 
@@ -431,7 +437,9 @@ def rotate_webhook_secret(webhook_id: UUID, current_user=Depends(require_admin),
 
 
 @router.post("/{webhook_id}/deliveries/{delivery_id}/retry", response_model=WebhookDeliveryResponse)
-def retry_delivery(webhook_id: UUID, delivery_id: UUID, db: Session = Depends(get_db)):
+def retry_delivery(
+    webhook_id: UUID, delivery_id: UUID, current_user=Depends(require_admin), db: Session = Depends(get_db)
+):
     _get_webhook_or_404(db, webhook_id)
     delivery = (
         db.query(WebhookDelivery)
@@ -453,6 +461,14 @@ def retry_delivery(webhook_id: UUID, delivery_id: UUID, db: Session = Depends(ge
 
     dispatch_delivery(db, delivery.id)
     db.refresh(delivery)
+    audit_log.log(
+        "webhook_delivery_retried",
+        {
+            "webhook_id": str(webhook_id),
+            "delivery_id": str(delivery_id),
+            "actor": getattr(current_user, "email", "unknown"),
+        },
+    )
     return _serialize_delivery(delivery)
 
 
@@ -474,7 +490,9 @@ def list_dead_letter_deliveries(
 
 
 @router.post("/{webhook_id}/deliveries/{delivery_id}/replay", response_model=WebhookDeliveryResponse)
-def replay_dead_letter_delivery(webhook_id: UUID, delivery_id: UUID, db: Session = Depends(get_db)):
+def replay_dead_letter_delivery(
+    webhook_id: UUID, delivery_id: UUID, current_user=Depends(require_admin), db: Session = Depends(get_db)
+):
     """Replay a dead-lettered delivery."""
     _get_webhook_or_404(db, webhook_id)
     delivery = (
@@ -498,6 +516,14 @@ def replay_dead_letter_delivery(webhook_id: UUID, delivery_id: UUID, db: Session
         )
 
     db.refresh(delivery)
+    audit_log.log(
+        "webhook_dead_letter_replayed",
+        {
+            "webhook_id": str(webhook_id),
+            "delivery_id": str(delivery_id),
+            "actor": getattr(current_user, "email", "unknown"),
+        },
+    )
     return _serialize_delivery(delivery)
 
 
@@ -505,12 +531,29 @@ def replay_dead_letter_delivery(webhook_id: UUID, delivery_id: UUID, db: Session
 
 
 @router.post("/replay-by-context", response_model=WebhookReplayResponse)
-def replay_deliveries_by_context(event: WebhookEvent, payload: WebhookReplayRequest, db: Session = Depends(get_db)):
+def replay_deliveries_by_context(
+    event: WebhookEvent,
+    payload: WebhookReplayRequest,
+    current_user=Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     """Replay deliveries by event and context (device or outage)."""
     from app.services.webhook_service import replay_deliveries_by_event_context
 
     replayed_count = replay_deliveries_by_event_context(
         db, event=event, device_id=payload.device_id, outage_id=payload.outage_id, limit=payload.limit
+    )
+
+    audit_log.log(
+        "webhook_replayed_by_context",
+        {
+            "event": event.value,
+            "device_id": payload.device_id,
+            "outage_id": payload.outage_id,
+            "limit": payload.limit,
+            "replayed_count": replayed_count,
+            "actor": getattr(current_user, "email", "unknown"),
+        },
     )
 
     return WebhookReplayResponse(
