@@ -96,6 +96,22 @@ class Settings(BaseSettings):
     WEBHOOK_BREAKER_WINDOW_SECONDS: int = 300
     WEBHOOK_BREAKER_RESET_SECONDS: int = 600
 
+    # Audit-log sensitive fields to redact (consumed by app/services/scrubber.py)
+    AUDIT_SENSITIVE_FIELDS: list[str] = [
+        "password",
+        "token",
+        "access_token",
+        "refresh_token",
+        "secret",
+        "secret_key",
+        "api_key",
+        "mnemonic",
+        "seed",
+        "pin",
+        "signed_tx",
+        "stellar_secret",
+    ]
+
     # Webhook retry backoff policy (#236)
     # Comma-separated base delay seconds for each retry attempt.
     # e.g. "30,120,600" means 30 s on first retry, 2 min on second, 10 min on third.
